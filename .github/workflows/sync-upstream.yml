@@ -1,0 +1,90 @@
+name: Sync Upstream (safe, no-conflict)
+
+# 全自动同步上游 mtvpls/MoonTVPlus 的更新。
+#
+# 策略：「取上游全部代码」+「用本仓库自己的 workflow 覆盖回去」，
+# 不做 merge，因此永不产生冲突，也永远不会破坏自动部署 / 网站。
+#
+# 结果：
+#   - src/ 等网站代码  = 永远跟上游最新
+#   - .github/workflows/  = 永远保持本仓库自己的版本
+#     （cloudflare-deploy.yml 的 push 触发器 / docker 推包目标 不会被覆盖）
+
+on:
+  schedule:
+    - cron: '0 18 * * *'      # 每天北京时间 02:00 自动同步
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "upstream-sync-bot"
+          git config user.email "upstream-sync-bot@users.noreply.github.com"
+
+      - name: Backup our custom workflows
+        run: |
+          mkdir -p /tmp/keep
+          for f in cloudflare-deploy.yml docker-image-lite.yml docker-image.yml; do
+            if [ -f ".github/workflows/$f" ]; then
+              cp ".github/workflows/$f" "/tmp/keep/$f"
+              echo "backed up $f"
+            fi
+          done
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/mtvpls/MoonTVPlus.git || true
+          git fetch upstream main --depth=1
+
+      - name: Check whether upstream moved
+        id: check
+        run: |
+          UP=$(git rev-parse upstream/main)
+          echo "upstream=$UP" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$UP" HEAD; then
+            echo "already_current=true" >> "$GITHUB_OUTPUT"
+            echo "已经是最新，无需同步"
+          else
+            echo "already_current=false" >> "$GITHUB_OUTPUT"
+            echo "上游有新提交，需要同步"
+          fi
+
+      - name: Reset to upstream and restore our workflows
+        if: steps.check.outputs.already_current == 'false'
+        run: |
+          set -e
+          git reset --hard "${{ steps.check.outputs.upstream }}"
+          for f in cloudflare-deploy.yml docker-image-lite.yml docker-image.yml; do
+            if [ -f "/tmp/keep/$f" ]; then
+              cp "/tmp/keep/$f" ".github/workflows/$f"
+              echo "restored $f"
+            fi
+          done
+          git add -A
+          if git diff --cached --quiet; then
+            echo "无变化"
+          else
+            git commit -m "chore: sync upstream code (保留本地 workflow 自定义)"
+          fi
+
+      - name: Push
+        if: steps.check.outputs.already_current == 'false'
+        run: |
+          git push --force-with-lease origin HEAD:main
+          echo "同步完成"
